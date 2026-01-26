@@ -52,4 +52,7 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
     // ML Kit Translation
     implementation("com.google.mlkit:translate:17.0.3")
+    
+    // UI Components
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
 }

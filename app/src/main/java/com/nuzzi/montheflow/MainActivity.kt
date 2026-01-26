@@ -1,10 +1,17 @@
 package com.nuzzi.montheflow
 
 import android.Manifest
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
+import android.view.View
 import android.widget.Button
+import android.widget.ImageButton
+import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
@@ -16,6 +23,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.mlkit.nl.translate.TranslateLanguage
 import java.util.Locale
+import kotlin.system.exitProcess
 
 class MainActivity : AppCompatActivity() {
 
@@ -23,19 +31,28 @@ class MainActivity : AppCompatActivity() {
     private var audioRecorderManager: AudioRecorderManager? = null
     private var translationManager: TranslationManager? = null
     private var ttsManager: TTSManager? = null
+    private var transcriptSaver: TranscriptSaver? = null // Saver
     
     // UI elements
     private var statusTextView: TextView? = null
     private var languageRadioGroup: RadioGroup? = null
-    private var btnForceCut: Button? = null
+    
+    private var btnTranslateNow: ImageButton? = null
+    private var btnReset: ImageButton? = null
+    private var btnStopExit: ImageButton? = null
+    private var btnSettings: ImageButton? = null
+    
+    // Flags UI for visual effect
+    private var radioItalian: RadioButton? = null
+    private var radioPortuguese: RadioButton? = null
 
-    // TODO: INSERISCI QUI LA TUA API KEY DI ASSEMBLYAI
-    private val API_KEY = "1c88814eb62b47adac31514e19b0ae66"
+    // API Key is now retrieved dynamically
+    private var currentApiKey: String = ""
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
             if (isGranted) {
-                startTranslationFlow()
+                checkKeyAndStart()
             } else {
                 Toast.makeText(this, "Permission required to record audio", Toast.LENGTH_SHORT).show()
             }
@@ -60,15 +77,26 @@ class MainActivity : AppCompatActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
         
+        // Binding UI
         statusTextView = findViewById(R.id.statusText)
         languageRadioGroup = findViewById(R.id.languageRadioGroup)
-        btnForceCut = findViewById(R.id.btnForceCut)
+        
+        btnTranslateNow = findViewById(R.id.btnTranslateNow)
+        btnReset = findViewById(R.id.btnReset)
+        btnStopExit = findViewById(R.id.btnStopExit)
+        btnSettings = findViewById(R.id.btnSettings)
+        
+        radioItalian = findViewById(R.id.radioItalian)
+        radioPortuguese = findViewById(R.id.radioPortuguese)
         
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
             insets
         }
+
+        // Inizializza Saver
+        transcriptSaver = TranscriptSaver(this)
 
         // Inizializza TTS
         ttsManager = TTSManager(this)
@@ -77,18 +105,59 @@ class MainActivity : AppCompatActivity() {
         translationManager = TranslationManager {
             Log.d("MainActivity", "Translation model ready")
             runOnUiThread {
-                statusTextView?.append("\nTranslation Model Ready")
+                if (statusTextView?.text?.contains("Translation Model") != true) {
+                   statusTextView?.append("\nTranslation Model Ready")
+                }
             }
         }
 
         setupLanguageControls()
-        setupForceCutButton()
-        setupAssemblyAI()
-        checkPermissionsAndStart()
+        setupButtons()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        validateApiKeyAndInit()
+    }
+
+    private fun validateApiKeyAndInit() {
+        val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
+        val storedKey = prefs.getString("ASSEMBLYAI_KEY", "")
+
+        if (storedKey.isNullOrEmpty()) {
+            statusTextView?.text = "API Key Missing!\nPlease configure settings."
+            startSettingsBlink()
+        } else {
+            stopSettingsBlink()
+            currentApiKey = storedKey
+            checkPermissionsAndStart()
+        }
+    }
+
+    // Animazione lampeggiante per Settings
+    private var blinkAnimator: ObjectAnimator? = null
+    
+    private fun startSettingsBlink() {
+        if (blinkAnimator == null) {
+            blinkAnimator = ObjectAnimator.ofFloat(btnSettings, "alpha", 1f, 0.2f, 1f).apply {
+                duration = 1000
+                repeatCount = ValueAnimator.INFINITE
+                start()
+            }
+        }
+    }
+
+    private fun stopSettingsBlink() {
+        blinkAnimator?.cancel()
+        blinkAnimator = null
+        btnSettings?.alpha = 1f
     }
 
     private fun setupLanguageControls() {
         languageRadioGroup?.setOnCheckedChangeListener { _, checkedId ->
+            radioItalian?.alpha = if (checkedId == R.id.radioItalian) 1.0f else 0.4f
+            radioPortuguese?.alpha = if (checkedId == R.id.radioPortuguese) 1.0f else 0.4f
+
             when (checkedId) {
                 R.id.radioItalian -> {
                     changeTargetLanguage(TranslateLanguage.ITALIAN, Locale.ITALIAN)
@@ -100,36 +169,70 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupForceCutButton() {
-        btnForceCut?.setOnClickListener {
-            Log.d("MainActivity", "User triggered Force Cut")
+    private fun setupButtons() {
+        // Settings Button
+        btnSettings?.setOnClickListener {
+            val intent = Intent(this, SettingsActivity::class.java)
+            startActivity(intent)
+        }
+
+        // 1. STOP / EXIT (Rosso)
+        btnStopExit?.setOnClickListener {
+            Log.d("MainActivity", "User triggered STOP/EXIT")
+            ttsManager?.stop()
+            audioRecorderManager?.stop()
+            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+            
+            finishAffinity() 
+            exitProcess(0)
+        }
+
+        // 2. RESET (Arancione)
+        btnReset?.setOnClickListener {
+            Log.d("MainActivity", "User triggered RESET")
+            resetAppFlow()
+        }
+
+        // 3. TRANSLATE NOW (Verde)
+        btnTranslateNow?.setOnClickListener {
+            Log.d("MainActivity", "User triggered TRANSLATE NOW")
             statusTextView?.append("\n[FORCING CUT...]")
-            assemblyAIClient.forceEndTurn()
+            if (::assemblyAIClient.isInitialized) {
+                assemblyAIClient.forceEndTurn()
+            }
+        }
+    }
+
+    private fun resetAppFlow() {
+        runOnUiThread {
+            ttsManager?.interrupt()
+            audioRecorderManager?.stop()
+            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+            
+            statusTextView?.text = "Resetting..."
+            
+            statusTextView?.postDelayed({
+                statusTextView?.text = "Restarting..."
+                checkPermissionsAndStart()
+            }, 500)
         }
     }
 
     private fun changeTargetLanguage(mlKitLangCode: String, ttsLocale: Locale) {
         statusTextView?.append("\nSwitching to ${ttsLocale.displayLanguage}...")
-        
-        // Aggiorna Traduttore
         translationManager?.setTargetLanguage(mlKitLangCode)
         
-        // Aggiorna TTS e gestisci errore dati mancanti
         val isTTSReady = ttsManager?.setLanguage(ttsLocale) ?: false
-        
         if (!isTTSReady) {
             val msg = "Voice data for ${ttsLocale.displayLanguage} missing!"
-            statusTextView?.append("\nWarning: $msg")
             Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-            
-            // Suggerisci all'utente di installare i dati
             openTTSCheck()
         }
     }
 
     private fun openTTSCheck() {
         try {
-            val intent = android.content.Intent()
+            val intent = Intent()
             intent.action = android.speech.tts.TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA
             startActivity(intent)
         } catch (e: Exception) {
@@ -138,11 +241,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupAssemblyAI() {
-        assemblyAIClient = AssemblyAIClient(API_KEY, object : AssemblyAIClient.TranscriptionListener {
+        if (currentApiKey.isEmpty()) return
+
+        assemblyAIClient = AssemblyAIClient(currentApiKey, object : AssemblyAIClient.TranscriptionListener {
             override fun onConnected() {
                 runOnUiThread {
                     statusTextView?.append("\nConnected! Speak now...")
                 }
+                // Avvia nuovo file per la sessione
+                transcriptSaver?.startNewSession()
             }
 
             override fun onTranscription(text: String, isFinal: Boolean) {
@@ -154,7 +261,11 @@ class MainActivity : AppCompatActivity() {
                         runOnUiThread {
                             statusTextView?.text = "En: $text\nTarget: $translatedText"
                         }
-                        // Parla solo il testo finale tradotto
+                        
+                        // Salva nel file (append)
+                        val logLine = "[EN]: $text\n[TR]: $translatedText\n"
+                        transcriptSaver?.append(logLine)
+                        
                         ttsManager?.speak(translatedText)
                     }
                 } else {
@@ -175,25 +286,31 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkPermissionsAndStart() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            startTranslationFlow()
+            checkKeyAndStart()
         } else {
             requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
+    private fun checkKeyAndStart() {
+        if (currentApiKey.isEmpty()) {
+            Toast.makeText(this, "Please set API Key first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startTranslationFlow()
+    }
+
     private fun startTranslationFlow() {
         try {
-            statusTextView?.append("\nStarting flow...")
+            setupAssemblyAI()
             
-            // Avvia connessione WebSocket
+            statusTextView?.append("\nStarting flow...")
             assemblyAIClient.start()
 
-            // Inizializza Recorder
             audioRecorderManager = AudioRecorderManager { audioData ->
                 assemblyAIClient.sendAudio(audioData)
             }
             
-            // Avvia registrazione
             audioRecorderManager?.start()
             statusTextView?.append("\nMic started.")
             
@@ -206,7 +323,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         audioRecorderManager?.stop()
-        assemblyAIClient.stop()
+        if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
         translationManager?.close()
         ttsManager?.stop()
     }

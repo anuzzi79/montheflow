@@ -50,6 +50,11 @@ class TTSManager(context: Context) : TextToSpeech.OnInitListener {
         tts?.speak(text, TextToSpeech.QUEUE_ADD, null, null)
     }
 
+    fun interrupt() {
+        // Interrompe immediatamente il parlato corrente e svuota la coda
+        tts?.stop()
+    }
+
     fun stop() {
         tts?.stop()
         tts?.shutdown()

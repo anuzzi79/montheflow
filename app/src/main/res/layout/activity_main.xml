@@ -5,74 +5,155 @@
     android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="16dp"
+    android:background="#121212"
     tools:context=".MainActivity">
 
-    <LinearLayout
-        android:id="@+id/languageContainer"
+    <!-- HEADER BAR -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/headerContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+        android:padding="16dp"
+        android:background="#000000"
+        app:layout_constraintTop_toTopOf="parent">
 
         <TextView
+            android:id="@+id/lblTranslateTo"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Target: "
+            android:text="Translate to"
+            android:textColor="#FFFFFF"
+            android:textSize="24sp"
             android:textStyle="bold"
-            android:textSize="16sp"/>
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent"/>
 
         <RadioGroup
             android:id="@+id/languageRadioGroup"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:checkedButton="@+id/radioItalian">
+            android:layout_marginStart="16dp"
+            app:layout_constraintStart_toEndOf="@id/lblTranslateTo"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent">
 
             <RadioButton
                 android:id="@+id/radioItalian"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Italiano 🇮🇹"
-                android:paddingEnd="16dp"/>
+                android:text="🇮🇹"
+                android:textSize="28sp"
+                android:textColor="#FFFFFF"
+                android:button="@null"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:paddingHorizontal="8dp"
+                android:alpha="1.0"/>
 
             <RadioButton
                 android:id="@+id/radioPortuguese"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Português 🇧🇷"/>
+                android:text="🇧🇷"
+                android:textSize="28sp"
+                android:textColor="#FFFFFF"
+                android:button="@null"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:paddingHorizontal="8dp"
+                android:alpha="0.4"/>
         </RadioGroup>
 
-    </LinearLayout>
+        <ImageButton
+            android:id="@+id/btnSettings"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@android:drawable/ic_menu_preferences"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            app:tint="#FFFFFF"
+            android:scaleType="fitCenter"
+            android:padding="8dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent"/>
 
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- STATUS TEXT -->
     <TextView
         android:id="@+id/statusText"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:text="Initializing..."
+        android:text="Waiting for configuration..."
         android:textAlignment="center"
         android:textSize="20sp"
+        android:textColor="#DDDDDD"
         android:gravity="center"
         android:layout_marginBottom="16dp"
-        app:layout_constraintTop_toBottomOf="@id/languageContainer"
-        app:layout_constraintBottom_toTopOf="@+id/btnForceCut"
+        app:layout_constraintTop_toBottomOf="@id/headerContainer"
+        app:layout_constraintBottom_toTopOf="@+id/footerContainer"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
-    <Button
-        android:id="@+id/btnForceCut"
+    <!-- FOOTER CONTAINER PER I 3 BOTTONI -->
+    <LinearLayout
+        android:id="@+id/footerContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="TRADUCI ORA (Force Cut)"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:padding="16dp"
-        android:backgroundTint="#FF5722"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="24dp"
+        android:paddingTop="8dp"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <!-- SPAZIO -->
+        <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+
+        <!-- BOTTONE STOP (ROSSO) - Chiude App -->
+        <ImageButton
+            android:id="@+id/btnStopExit"
+            android:layout_width="80dp"
+            android:layout_height="80dp"
+            android:src="@drawable/stop"
+            android:background="@drawable/circle_background"
+            android:backgroundTint="#D32F2F"
+            android:scaleType="centerInside"
+            android:padding="20dp"
+            android:elevation="6dp"/>
+
+        <!-- SPAZIO -->
+        <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+
+        <!-- BOTTONE RESET (ARANCIONE) - Riavvia Processo -->
+        <ImageButton
+            android:id="@+id/btnReset"
+            android:layout_width="80dp"
+            android:layout_height="80dp"
+            android:src="@drawable/reset"
+            android:background="@drawable/circle_background"
+            android:backgroundTint="#F57C00"
+            android:scaleType="centerInside"
+            android:padding="20dp"
+            android:elevation="6dp"/>
+
+        <!-- SPAZIO -->
+        <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+
+        <!-- BOTTONE TRANSLATE (VERDE) - Force Cut -->
+        <ImageButton
+            android:id="@+id/btnTranslateNow"
+            android:layout_width="80dp"
+            android:layout_height="80dp"
+            android:src="@drawable/translate_now"
+            android:background="@drawable/circle_background"
+            android:backgroundTint="#388E3C"
+            android:scaleType="centerInside"
+            android:padding="20dp"
+            android:elevation="6dp"/>
+
+        <!-- SPAZIO -->
+        <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+
+    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
