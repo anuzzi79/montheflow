@@ -1,0 +1,15 @@
+{
+  "base_dir": "C:/Users/Antonio Nuzzi/montheflow",
+  "files": [
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\AssemblyAIClient.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\AudioRecorderManager.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\HistoryActivity.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\MainActivity.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\SettingsActivity.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\TTSManager.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\TranscriptSaver.kt",
+    "app\\src\\main\\java\\com\\nuzzi\\montheflow\\TranslationManager.kt",
+    "app\\src\\main\\res\\layout\\activity_main.xml",
+    "build.gradle.kts"
+  ]
+}

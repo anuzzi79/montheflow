@@ -3,6 +3,7 @@ package com.nuzzi.montheflow
 import android.Manifest
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +12,7 @@ import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.ImageButton
+import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.TextView
@@ -24,6 +26,7 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.mlkit.nl.translate.TranslateLanguage
 import java.util.Locale
 import kotlin.system.exitProcess
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -31,23 +34,47 @@ class MainActivity : AppCompatActivity() {
     private var audioRecorderManager: AudioRecorderManager? = null
     private var translationManager: TranslationManager? = null
     private var ttsManager: TTSManager? = null
-    private var transcriptSaver: TranscriptSaver? = null // Saver
+    private var transcriptSaver: TranscriptSaver? = null
     
     // UI elements
     private var statusTextView: TextView? = null
+    private var progressBar: ProgressBar? = null // NUOVO
     private var languageRadioGroup: RadioGroup? = null
     
+    private var btnPlay: ImageButton? = null
     private var btnTranslateNow: ImageButton? = null
     private var btnReset: ImageButton? = null
-    private var btnStopExit: ImageButton? = null
+    private var btnPause: ImageButton? = null
+    private var btnStop: ImageButton? = null
     private var btnSettings: ImageButton? = null
     
-    // Flags UI for visual effect
+    private var silenceThresholdSeekBar: android.widget.SeekBar? = null
+    private var lblThresholdValue: TextView? = null
+    private var currentSilenceThreshold = 500
+    
     private var radioItalian: RadioButton? = null
     private var radioPortuguese: RadioButton? = null
 
-    // API Key is now retrieved dynamically
     private var currentApiKey: String = ""
+    
+    // Timer per gestire il silenzio manualmente (Client-Side)
+    private var silenceHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var silenceRunnable: Runnable? = null
+    private var textBuffer = StringBuilder()
+    
+    // True quando streaming + recorder sono attivi (equivalente a "sessione in andamento")
+    private var isStreamingActive: Boolean = false
+    
+    private fun logDebug(message: String, data: String = "{}") {
+        try {
+            val file = File("c:\\Users\\Antonio Nuzzi\\montheflow\\.cursor\\debug.log")
+            val timestamp = System.currentTimeMillis()
+            val json = "{\"id\":\"log_${timestamp}\",\"timestamp\":$timestamp,\"location\":\"MainActivity.kt\",\"message\":\"$message\",\"data\":$data,\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C,D\"}\n"
+            file.appendText(json)
+        } catch (e: Exception) {
+            // Ignore
+        }
+    }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
@@ -61,30 +88,33 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Gestore crash per debug
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try { transcriptSaver?.endSession("Session ended (CRASH)") } catch (_: Exception) {}
             Log.e("CRASH", "Uncaught exception", throwable)
             runOnUiThread {
                 try {
                     statusTextView?.text = "CRASH: ${throwable.message}\n${throwable.stackTraceToString()}"
                     statusTextView?.setTextColor(android.graphics.Color.RED)
-                } catch (e: Exception) {
-                    // Ignora errori UI durante il crash
-                }
+                } catch (e: Exception) {}
             }
         }
         
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
-        
-        // Binding UI
+
         statusTextView = findViewById(R.id.statusText)
+        progressBar = findViewById(R.id.progressBar)
         languageRadioGroup = findViewById(R.id.languageRadioGroup)
         
+        btnPlay = findViewById(R.id.btnPlayAction)
         btnTranslateNow = findViewById(R.id.btnTranslateNow)
         btnReset = findViewById(R.id.btnReset)
-        btnStopExit = findViewById(R.id.btnStopExit)
+        btnPause = findViewById(R.id.btnPause)
+        btnStop = findViewById(R.id.btnStop)
         btnSettings = findViewById(R.id.btnSettings)
+        
+        silenceThresholdSeekBar = findViewById(R.id.silenceThresholdSeekBar)
+        lblThresholdValue = findViewById(R.id.lblThresholdValue)
         
         radioItalian = findViewById(R.id.radioItalian)
         radioPortuguese = findViewById(R.id.radioPortuguese)
@@ -95,24 +125,125 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        // Inizializza Saver
-        transcriptSaver = TranscriptSaver(this)
+        // Check Google Play Services
+        val googleApiAvailability = com.google.android.gms.common.GoogleApiAvailability.getInstance()
+        val status = googleApiAvailability.isGooglePlayServicesAvailable(this)
+        if (status != com.google.android.gms.common.ConnectionResult.SUCCESS) {
+             googleApiAvailability.getErrorDialog(this, status, 9000)?.show()
+        }
 
-        // Inizializza TTS
+        transcriptSaver = TranscriptSaver(this)
         ttsManager = TTSManager(this)
 
-        // Inizializza Traduzione
-        translationManager = TranslationManager {
-            Log.d("MainActivity", "Translation model ready")
+        // Inizializza Traduzione con gestione stato visuale
+        translationManager = TranslationManager { statusMsg, isError ->
+            Log.d("MainActivity", "Translation Status: $statusMsg")
             runOnUiThread {
-                if (statusTextView?.text?.contains("Translation Model") != true) {
-                   statusTextView?.append("\nTranslation Model Ready")
+                if (isError) {
+                    statusTextView?.text = "ERROR: $statusMsg"
+                    statusTextView?.setTextColor(android.graphics.Color.RED)
+                    progressBar?.visibility = View.INVISIBLE
+                } else {
+                    if (statusTextView?.text?.startsWith("En:") == false) {
+                        statusTextView?.text = statusMsg
+                        statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+                    }
+                    
+                    // Gestione ProgressBar
+                    if (statusMsg.contains("Downloading", ignoreCase = true)) {
+                        progressBar?.visibility = View.VISIBLE
+                    } else if (statusMsg.contains("Ready", ignoreCase = true)) {
+                        progressBar?.visibility = View.INVISIBLE
+                    }
                 }
             }
         }
 
         setupLanguageControls()
         setupButtons()
+        
+        // Controlla se è il primo avvio per chiedere la lingua
+        checkFirstRunAndLanguage()
+        
+        setupSilenceControl()
+    }
+
+    private fun setupSilenceControl() {
+        val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
+        currentSilenceThreshold = prefs.getInt("SILENCE_THRESHOLD", 500)
+        
+        // Converti ms a progress (0-10)
+        // 500ms -> 0
+        // 3000ms -> 10
+        // Step 250ms
+        val progress = (currentSilenceThreshold - 500) / 250
+        silenceThresholdSeekBar?.max = 10 // Max 3 secondi
+        silenceThresholdSeekBar?.progress = progress
+        updateThresholdLabel(currentSilenceThreshold)
+
+        silenceThresholdSeekBar?.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                val newThreshold = 500 + (progress * 250)
+                updateThresholdLabel(newThreshold)
+            }
+
+            override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
+
+            override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {
+                seekBar?.let {
+                    val newThreshold = 500 + (it.progress * 250)
+                    // #region agent log
+                    logDebug("SeekBar Stop Tracking", "{\"newThreshold\":$newThreshold, \"oldThreshold\":$currentSilenceThreshold}")
+                    // #endregion
+                    if (newThreshold != currentSilenceThreshold) {
+                        val wasActive = isStreamingActive
+
+                        currentSilenceThreshold = newThreshold
+                        prefs.edit().putInt("SILENCE_THRESHOLD", currentSilenceThreshold).apply()
+
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Threshold set to ${newThreshold}ms. Restarting...",
+                            Toast.LENGTH_SHORT
+                        ).show()
+
+                        restartAfterThresholdChange(wasActive)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun updateThresholdLabel(thresholdMs: Int) {
+        lblThresholdValue?.text = String.format("%.1fs", thresholdMs / 1000f)
+    }
+
+    private fun checkFirstRunAndLanguage() {
+        val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
+        val isFirstRun = prefs.getBoolean("FIRST_RUN_LANG", true)
+
+        if (isFirstRun) {
+            showLanguageSelectionDialog(prefs)
+        }
+    }
+
+    private fun showLanguageSelectionDialog(prefs: android.content.SharedPreferences) {
+        val languages = arrayOf("Italiano 🇮🇹", "Português 🇧🇷")
+        AlertDialog.Builder(this)
+            .setTitle("Select Target Language")
+            .setItems(languages) { _, which ->
+                when (which) {
+                    0 -> { // Italiano
+                        languageRadioGroup?.check(R.id.radioItalian)
+                    }
+                    1 -> { // Portoghese
+                        languageRadioGroup?.check(R.id.radioPortuguese)
+                    }
+                }
+                prefs.edit().putBoolean("FIRST_RUN_LANG", false).apply()
+            }
+            .setCancelable(false)
+            .show()
     }
 
     override fun onResume() {
@@ -134,7 +265,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Animazione lampeggiante per Settings
     private var blinkAnimator: ObjectAnimator? = null
     
     private fun startSettingsBlink() {
@@ -170,40 +300,122 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupButtons() {
-        // Settings Button
+        Log.d("MainActivity", "DEBUG: setupButtons called")
+        if (btnPlay == null) {
+            Log.e("MainActivity", "CRITICAL: btnPlay is NULL! Check layout ID.")
+            Toast.makeText(this, "Error: Play button missing", Toast.LENGTH_LONG).show()
+        } else {
+            Log.d("MainActivity", "DEBUG: btnPlay found, attaching listener")
+        }
+
         btnSettings?.setOnClickListener {
             val intent = Intent(this, SettingsActivity::class.java)
             startActivity(intent)
         }
 
-        // 1. STOP / EXIT (Rosso)
-        btnStopExit?.setOnClickListener {
-            Log.d("MainActivity", "User triggered STOP/EXIT")
-            ttsManager?.stop()
+        btnPlay?.setOnClickListener {
+            Log.d("MainActivity", "DEBUG: User triggered PLAY (Listener OK)")
+            Toast.makeText(this, "Play Clicked!", Toast.LENGTH_SHORT).show() 
+
+            if (currentApiKey.isEmpty()) {
+                Log.e("MainActivity", "DEBUG: API Key is empty!")
+                Toast.makeText(this, "Please configure API Key first", Toast.LENGTH_SHORT).show()
+                startSettingsBlink()
+            } else {
+                Log.d("MainActivity", "DEBUG: Key found, calling startTranslationFlow")
+
+                // Session TXT starts on first Play after app launch (and continues across Pause/threshold/background)
+                transcriptSaver?.ensureSessionStarted()
+
+                isStreamingActive = true
+                startTranslationFlow()
+            }
+        }
+
+        btnPause?.setOnClickListener {
+            Log.d("MainActivity", "User triggered PAUSE/STOP")
+            isStreamingActive = false
+            
+            // Ferma tutto ma non chiude l'app
+            ttsManager?.interrupt()
             audioRecorderManager?.stop()
             if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
             
-            finishAffinity() 
-            exitProcess(0)
+            // Ferma il timer del silenzio
+            silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+            
+            statusTextView?.text = "Paused. Press Play to resume."
+            statusTextView?.setTextColor(android.graphics.Color.YELLOW)
         }
 
-        // 2. RESET (Arancione)
+        btnStop?.setOnClickListener {
+            Log.d("MainActivity", "User triggered STOP (End session & exit)")
+            isStreamingActive = false
+            endSessionAndExitApp()
+        }
+
         btnReset?.setOnClickListener {
             Log.d("MainActivity", "User triggered RESET")
+            isStreamingActive = false
             resetAppFlow()
         }
+        
+        btnReset?.setOnLongClickListener {
+            Toast.makeText(this, "Hard Reset: Cleaning translation models...", Toast.LENGTH_LONG).show()
+            translationManager?.deleteModelsAndReset()
+            true
+        }
 
-        // 3. TRANSLATE NOW (Verde)
         btnTranslateNow?.setOnClickListener {
             Log.d("MainActivity", "User triggered TRANSLATE NOW")
             statusTextView?.append("\n[FORCING CUT...]")
+            
+            // Forza il timer locale a scattare subito se c'è roba nel buffer
+            silenceRunnable?.let {
+                silenceHandler.removeCallbacks(it)
+                it.run() // Esegue immediatamente la logica di traduzione
+            }
+            
             if (::assemblyAIClient.isInitialized) {
                 assemblyAIClient.forceEndTurn()
             }
         }
     }
 
+    private fun restartAfterThresholdChange(wasActive: Boolean) {
+        runOnUiThread {
+            // Stop clean (senza chiudere sessione txt)
+            try { ttsManager?.interrupt() } catch (_: Exception) {}
+            try { audioRecorderManager?.stop() } catch (_: Exception) {}
+            try { if (::assemblyAIClient.isInitialized) assemblyAIClient.stop() } catch (_: Exception) {}
+
+            // Stop timer silenzio
+            silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+            silenceRunnable = null
+            textBuffer.clear()
+
+            // Se era attivo, riparte automaticamente come se avessi premuto Play
+            if (wasActive) {
+                statusTextView?.text = "Restarting with new threshold..."
+                statusTextView?.setTextColor(android.graphics.Color.YELLOW)
+
+                // Piccolo delay per evitare race tra stop/start
+                statusTextView?.postDelayed({
+                    startTranslationFlow()
+                }, 250)
+            } else {
+                // Se non era attivo, torna allo stato "Ready. Press Play..."
+                isStreamingActive = false
+                checkPermissionsAndStart()
+            }
+        }
+    }
+
     private fun resetAppFlow() {
+        isStreamingActive = false
+        // #region agent log
+        logDebug("resetAppFlow called")
+        // #endregion
         runOnUiThread {
             ttsManager?.interrupt()
             audioRecorderManager?.stop()
@@ -218,8 +430,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun endSessionAndExitApp() {
+        // 1) Ferma timer silenzio
+        silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+        silenceRunnable = null
+
+        // 2) Ferma audio + websocket + TTS
+        try { ttsManager?.interrupt() } catch (_: Exception) {}
+        try { ttsManager?.stop() } catch (_: Exception) {}
+        try { audioRecorderManager?.stop() } catch (_: Exception) {}
+        try { if (::assemblyAIClient.isInitialized) assemblyAIClient.stop() } catch (_: Exception) {}
+
+        // Close transcript session explicitly
+        try { transcriptSaver?.endSession("Session ended by STOP") } catch (_: Exception) {}
+
+        // 3) Chiudi translator (rilascia risorse)
+        try { translationManager?.close() } catch (_: Exception) {}
+
+        // 4) UI feedback minimo
+        runOnUiThread {
+            statusTextView?.text = "Session ended."
+            statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+        }
+
+        // 5) Esci dall'app (chiusura vera, non pausa)
+        try {
+            finishAffinity() // chiude tutte le Activity dell'app
+        } catch (_: Exception) {}
+
+        // Forza terminazione processo per "uscita netta"
+        kotlin.system.exitProcess(0)
+    }
+
     private fun changeTargetLanguage(mlKitLangCode: String, ttsLocale: Locale) {
-        statusTextView?.append("\nSwitching to ${ttsLocale.displayLanguage}...")
+        // Avvia download modello
         translationManager?.setTargetLanguage(mlKitLangCode)
         
         val isTTSReady = ttsManager?.setLanguage(ttsLocale) ?: false
@@ -246,32 +490,50 @@ class MainActivity : AppCompatActivity() {
         assemblyAIClient = AssemblyAIClient(currentApiKey, object : AssemblyAIClient.TranscriptionListener {
             override fun onConnected() {
                 runOnUiThread {
-                    statusTextView?.append("\nConnected! Speak now...")
+                    statusTextView?.append("\nConnected! (Silence: ${currentSilenceThreshold}ms)\nSpeak now...")
                 }
-                // Avvia nuovo file per la sessione
-                transcriptSaver?.startNewSession()
             }
 
             override fun onTranscription(text: String, isFinal: Boolean) {
-                Log.d("MainActivity", "Transcribed: $text [Final: $isFinal]")
+                // LOGICA CLIENT-SIDE SILENCE:
+                // Ignoriamo parzialmente isFinal. Accumuliamo tutto e usiamo il nostro timer.
                 
-                if (isFinal) {
-                    translationManager?.translate(text) { translatedText ->
-                        Log.d("MainActivity", "Translated: $translatedText")
-                        runOnUiThread {
-                            statusTextView?.text = "En: $text\nTarget: $translatedText"
+                runOnUiThread {
+                    // Se arriva nuovo testo, resettiamo il timer
+                    silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+                    
+                    // Se è un parziale, aggiorniamo solo la UI "En: ..."
+                    // Se è Final (dal server), lo aggiungiamo al nostro buffer
+                    if (isFinal) {
+                        if (textBuffer.isNotEmpty()) textBuffer.append(" ")
+                        textBuffer.append(text)
+                        
+                        // Aggiorniamo UI provvisoria con tutto il buffer
+                        statusTextView?.text = "En: $textBuffer..."
+                    } else {
+                        // Per i parziali, mostriamo Buffer confermato + Parziale corrente
+                        val currentView = if (textBuffer.isNotEmpty()) "$textBuffer $text" else text
+                        statusTextView?.text = "En: $currentView..."
+                    }
+
+                    // Avviamo il timer di silenzio
+                    silenceRunnable = Runnable {
+                        // IL TIMER È SCATTATO!
+                        // Significa che per X secondi non è arrivato NIENTE (né parziale né final)
+                        
+                        // Se abbiamo testo parziale non finalizzato, purtroppo AssemblyAI non ce lo dà "fermo".
+                        // Ma se abbiamo testo nel buffer (da precedenti Final), lo mandiamo.
+                        // O se l'ultimo evento era Final, il buffer è pronto.
+                        
+                        val textToTranslate = textBuffer.toString().trim()
+                        if (textToTranslate.isNotEmpty()) {
+                            processTranslation(textToTranslate)
+                            textBuffer.clear()
                         }
-                        
-                        // Salva nel file (append)
-                        val logLine = "[EN]: $text\n[TR]: $translatedText\n"
-                        transcriptSaver?.append(logLine)
-                        
-                        ttsManager?.speak(translatedText)
                     }
-                } else {
-                     runOnUiThread {
-                        statusTextView?.text = "En: $text..."
-                    }
+                    
+                    // Usiamo il valore della levetta come ritardo
+                    silenceHandler.postDelayed(silenceRunnable!!, currentSilenceThreshold.toLong())
                 }
             }
 
@@ -282,6 +544,22 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
+    }
+
+    private fun processTranslation(text: String) {
+        val debugInfo = " [Timer: ${currentSilenceThreshold}ms]"
+        
+        translationManager?.translate(text) { translatedText ->
+            Log.d("MainActivity", "Translated: $translatedText")
+            runOnUiThread {
+                statusTextView?.text = "En: $text$debugInfo\nTarget: $translatedText"
+            }
+            
+            val logLine = "[EN]: $text$debugInfo\n[TR]: $translatedText\n"
+            transcriptSaver?.append(logLine)
+            
+            ttsManager?.speak(translatedText)
+        }
     }
 
     private fun checkPermissionsAndStart() {
@@ -297,34 +575,61 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Please set API Key first", Toast.LENGTH_SHORT).show()
             return
         }
-        startTranslationFlow()
+        // Non avviamo più automaticamente. Aspettiamo il Play.
+        statusTextView?.text = "Ready. Press Play to start."
     }
 
     private fun startTranslationFlow() {
+        Log.d("MainActivity", "DEBUG: Inside startTranslationFlow")
         try {
+            statusTextView?.text = "Connecting..."
+            statusTextView?.setTextColor(android.graphics.Color.YELLOW)
+
+            // Cleanup preventivo
+            if (::assemblyAIClient.isInitialized) {
+                Log.d("MainActivity", "DEBUG: Stopping previous client")
+                try { assemblyAIClient.stop() } catch (e: Exception) { Log.e("MainActivity", "Stop error", e) }
+            }
+            audioRecorderManager?.stop()
+
+            Log.d("MainActivity", "DEBUG: Calling setupAssemblyAI")
             setupAssemblyAI()
             
-            statusTextView?.append("\nStarting flow...")
-            assemblyAIClient.start()
+            if (!::assemblyAIClient.isInitialized) {
+                Log.e("MainActivity", "DEBUG: Client FAILED to initialize")
+                statusTextView?.text = "Error: Client not initialized (Check API Key)"
+                return
+            }
+            
+            // #region agent log
+            logDebug("Starting translation flow with threshold", "$currentSilenceThreshold")
+            // #endregion
+            Log.d("MainActivity", "DEBUG: Starting client with threshold $currentSilenceThreshold")
+            assemblyAIClient.start(currentSilenceThreshold)
 
             audioRecorderManager = AudioRecorderManager { audioData ->
                 assemblyAIClient.sendAudio(audioData)
             }
             
+            Log.d("MainActivity", "DEBUG: Starting recorder")
             audioRecorderManager?.start()
-            statusTextView?.append("\nMic started.")
+            isStreamingActive = true
             
         } catch (e: Exception) {
             Log.e("MainActivity", "Error starting translation flow", e)
             statusTextView?.text = "Error starting: ${e.message}"
+            statusTextView?.setTextColor(android.graphics.Color.RED)
+            isStreamingActive = false
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        isStreamingActive = false
         audioRecorderManager?.stop()
         if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
         translationManager?.close()
         ttsManager?.stop()
+        try { transcriptSaver?.endSession("Session ended (onDestroy)") } catch (_: Exception) {}
     }
 }

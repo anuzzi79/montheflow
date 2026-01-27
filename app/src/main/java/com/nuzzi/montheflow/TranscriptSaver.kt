@@ -13,6 +13,22 @@ import java.util.Locale
 class TranscriptSaver(private val context: Context) {
 
     private var currentFileUri: android.net.Uri? = null
+    private var sessionActive: Boolean = false
+
+    fun ensureSessionStarted() {
+        if (sessionActive && currentFileUri != null) return
+        startNewSession()
+        sessionActive = true
+    }
+
+    fun endSession(reason: String = "Session ended") {
+        if (!sessionActive) return
+        try {
+            append("--- $reason ---")
+        } catch (_: Exception) {}
+        currentFileUri = null
+        sessionActive = false
+    }
     
     fun startNewSession() {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
@@ -28,13 +44,14 @@ class TranscriptSaver(private val context: Context) {
             currentFileUri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
             append("--- Session Started: $timestamp ---\n")
             Log.d(TAG, "Created transcript file: $filename")
+            sessionActive = true
         } catch (e: Exception) {
             Log.e(TAG, "Error creating transcript file", e)
         }
     }
 
     fun append(text: String) {
-        if (currentFileUri == null) return
+        if (!sessionActive || currentFileUri == null) return
 
         try {
             // "wa" mode opens for writing and appending

@@ -4,6 +4,8 @@ import android.util.Log
 import com.google.gson.Gson
 import okhttp3.*
 import okio.ByteString.Companion.toByteString
+import java.io.File
+import java.util.Date
 
 class AssemblyAIClient(
     private val apiKey: String,
@@ -20,25 +22,28 @@ class AssemblyAIClient(
         fun onConnected()
     }
 
-    // Helper per debug
-    private fun logDebug(hypothesisId: String, msg: String, data: String = "{}") {
-        val timestamp = System.currentTimeMillis()
-        val safeMsg = msg.replace("\"", "'")
-        val json = "{\"id\":\"log_${timestamp}\",\"timestamp\":${timestamp},\"location\":\"AssemblyAIClient.kt\",\"message\":\"${safeMsg}\",\"data\":${data},\"sessionId\":\"debug-session\",\"hypothesisId\":\"${hypothesisId}\"}"
-        Log.e("CURSOR_DEBUG", json)
+    private fun logDebug(message: String, data: String = "{}") {
+        try {
+            val file = File("c:\\Users\\Antonio Nuzzi\\montheflow\\.cursor\\debug.log")
+            val timestamp = System.currentTimeMillis()
+            val json = "{\"id\":\"log_${timestamp}\",\"timestamp\":$timestamp,\"location\":\"AssemblyAIClient.kt\",\"message\":\"$message\",\"data\":$data,\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B,C\"}\n"
+            file.appendText(json)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write debug log", e)
+        }
     }
 
-    fun start() {
-        // AGGIORNAMENTO ALLA V3 (Documentazione Universal Streaming)
-        // Aggiungiamo format_turns=true per avere punteggiatura (fondamentale per la traduzione)
-        // Impostiamo end_utterance_silence_threshold=500 per un bilanciamento ottimale tra reattività e contesto
-        val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&format_turns=true&end_utterance_silence_threshold=500"
+    fun start(silenceThreshold: Int = 500) {
+        // RIMOSSO format_turns=true per testare se interferisce con il silenzio
+        // val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&format_turns=true&end_utterance_silence_threshold=$silenceThreshold"
+        val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&end_utterance_silence_threshold=$silenceThreshold"
+        
+        Log.d(TAG, "Connecting to V3 URL: ${url.replace(apiKey, "HIDDEN_KEY")}") // Log di verifica URL
+        Log.d(TAG, "Silence Threshold applied: $silenceThreshold ms")
         
         // #region agent log
-        logDebug("V3", "Connecting with Optimized Params (500ms)", "{\"url\": \"$url\"}")
+        logDebug("Starting AssemblyAIClient", "{\"url\":\"${url.replace(apiKey, "HIDDEN")}\", \"silenceThreshold\":$silenceThreshold}")
         // #endregion
-
-        Log.d(TAG, "Connecting to V3 URL: $url")
 
         val request = Request.Builder()
             .url(url)
@@ -56,6 +61,10 @@ class AssemblyAIClient(
     fun forceEndTurn() {
         // Comando per forzare la chiusura della frase corrente (Cut manuale)
         // In V3 il comando corretto è "ForceEndpoint" (non ForceEndUtterance)
+        // Ma con la logica client-side, dobbiamo anche forzare il timer locale!
+        // Tuttavia, AssemblyAI non ha un modo per dirgli "dammi quello che hai in buffer ora anche se parziale".
+        // ForceEndpoint chiude il turno sul server -> Arriva un Final -> Il nostro codice lo accoda -> Timer parte.
+        // Quindi dobbiamo anche dire al client: "Se premi il bottone, ignora il timer e vai subito".
         val forceMsg = "{\"type\": \"ForceEndpoint\"}"
         Log.d(TAG, "Sending ForceEndpoint")
         webSocket?.send(forceMsg)
@@ -80,19 +89,17 @@ class AssemblyAIClient(
                 "Turn" -> {
                     // 'transcript' contiene il testo, 'end_of_turn' indica se è finale
                     if (!response.transcript.isNullOrEmpty()) {
-                        // LOGICA ANTI-DUPLICAZIONE:
+                        // #region agent log
+                        logDebug("Turn received", "{\"transcript\":\"${response.transcript}\", \"end_of_turn\":${response.end_of_turn}, \"turn_is_formatted\":${response.turn_is_formatted}}")
+                        // #endregion
+
+                        // LOGICA ANTI-DUPLICAZIONE RIMOSSA (senza format_turns non serve)
                         // Se format_turns=true, riceviamo prima un evento 'end_of_turn=true' (grezzo)
                         // e subito dopo uno 'turn_is_formatted=true' (con punteggiatura).
-                        // Per evitare che il TTS parli due volte, consideriamo "Finale" (e quindi da tradurre/parlare)
-                        // SOLO quello formattato.
                         
-                        var isFinal = response.end_of_turn == true
+                        val isFinal = response.end_of_turn == true
                         
-                        // Se è marcato come fine turno, ma NON è ancora formattato, aspettiamo il prossimo messaggio.
-                        if (isFinal && response.turn_is_formatted == false) {
-                            isFinal = false 
-                        }
-
+                        // Senza format_turns, ci fidiamo solo di end_of_turn
                         listener.onTranscription(response.transcript, isFinal)
                     }
                 }
@@ -101,9 +108,6 @@ class AssemblyAIClient(
                 }
                 "Error" -> {
                     Log.e(TAG, "Server Error V3: $text")
-                    // #region agent log
-                    logDebug("V3", "Received Error Message", "{\"payload\": \"${text.replace("\"", "'")}\"}")
-                    // #endregion
                     listener.onError("Server Error: $text")
                 }
                 "Termination" -> {
@@ -117,9 +121,6 @@ class AssemblyAIClient(
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
         Log.e(TAG, "WebSocket Failure V3", t)
-        // #region agent log
-        logDebug("V3", "WebSocket Failure", "{\"error\": \"${t.message}\", \"response_code\": ${response?.code}}")
-        // #endregion
         listener.onError(t.message ?: "Unknown error")
     }
 
