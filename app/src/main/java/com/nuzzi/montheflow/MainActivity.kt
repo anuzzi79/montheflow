@@ -1,16 +1,14 @@
 package com.nuzzi.montheflow
 
 import android.Manifest
-import android.animation.ObjectAnimator
-import android.animation.ValueAnimator
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.speech.SpeechRecognizer
 import android.util.Log
 import android.view.View
-import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.RadioButton
@@ -27,11 +25,12 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import java.util.Locale
 import kotlin.system.exitProcess
 import java.io.File
+import android.content.ActivityNotFoundException
+import android.provider.Settings
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var assemblyAIClient: AssemblyAIClient
-    private var audioRecorderManager: AudioRecorderManager? = null
+    private var speechClient: AndroidSpeechClient? = null
     private var translationManager: TranslationManager? = null
     private var ttsManager: TTSManager? = null
     private var transcriptSaver: TranscriptSaver? = null
@@ -55,12 +54,17 @@ class MainActivity : AppCompatActivity() {
     private var radioItalian: RadioButton? = null
     private var radioPortuguese: RadioButton? = null
 
-    private var currentApiKey: String = ""
-    
     // Timer per gestire il silenzio manualmente (Client-Side)
     private var silenceHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var silenceRunnable: Runnable? = null
     private var textBuffer = StringBuilder()
+    private var lastPartialText: String = ""
+
+    private val segmentHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var segmentRunnable: Runnable? = null
+    private val maxSegmentMs = 6000
+    private var lastResultAt: Long = 0L
+    private var hasOpenedSpeechSettings = false
     
     // True quando streaming + recorder sono attivi (equivalente a "sessione in andamento")
     private var isStreamingActive: Boolean = false
@@ -118,6 +122,11 @@ class MainActivity : AppCompatActivity() {
         
         radioItalian = findViewById(R.id.radioItalian)
         radioPortuguese = findViewById(R.id.radioPortuguese)
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            statusTextView?.text = "Speech recognition not available on this device."
+            btnPlay?.isEnabled = false
+        }
         
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -162,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         setupLanguageControls()
         setupButtons()
         
-        // Controlla se è il primo avvio per chiedere la lingua
+        // Controlla se Ã¨ il primo avvio per chiedere la lingua
         checkFirstRunAndLanguage()
         
         setupSilenceControl()
@@ -228,7 +237,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showLanguageSelectionDialog(prefs: android.content.SharedPreferences) {
-        val languages = arrayOf("Italiano 🇮🇹", "Português 🇧🇷")
+        val languages = arrayOf("Italiano ðŸ‡®ðŸ‡¹", "PortuguÃªs ðŸ‡§ðŸ‡·")
         AlertDialog.Builder(this)
             .setTitle("Select Target Language")
             .setItems(languages) { _, which ->
@@ -248,39 +257,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        validateApiKeyAndInit()
-    }
-
-    private fun validateApiKeyAndInit() {
-        val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
-        val storedKey = prefs.getString("ASSEMBLYAI_KEY", "")
-
-        if (storedKey.isNullOrEmpty()) {
-            statusTextView?.text = "API Key Missing!\nPlease configure settings."
-            startSettingsBlink()
-        } else {
-            stopSettingsBlink()
-            currentApiKey = storedKey
-            checkPermissionsAndStart()
-        }
-    }
-
-    private var blinkAnimator: ObjectAnimator? = null
-    
-    private fun startSettingsBlink() {
-        if (blinkAnimator == null) {
-            blinkAnimator = ObjectAnimator.ofFloat(btnSettings, "alpha", 1f, 0.2f, 1f).apply {
-                duration = 1000
-                repeatCount = ValueAnimator.INFINITE
-                start()
-            }
-        }
-    }
-
-    private fun stopSettingsBlink() {
-        blinkAnimator?.cancel()
-        blinkAnimator = null
-        btnSettings?.alpha = 1f
+        checkPermissionsAndStart()
     }
 
     private fun setupLanguageControls() {
@@ -317,19 +294,16 @@ class MainActivity : AppCompatActivity() {
             Log.d("MainActivity", "DEBUG: User triggered PLAY (Listener OK)")
             Toast.makeText(this, "Play Clicked!", Toast.LENGTH_SHORT).show() 
 
-            if (currentApiKey.isEmpty()) {
-                Log.e("MainActivity", "DEBUG: API Key is empty!")
-                Toast.makeText(this, "Please configure API Key first", Toast.LENGTH_SHORT).show()
-                startSettingsBlink()
-            } else {
-                Log.d("MainActivity", "DEBUG: Key found, calling startTranslationFlow")
-
-                // Session TXT starts on first Play after app launch (and continues across Pause/threshold/background)
-                transcriptSaver?.ensureSessionStarted()
-
-                isStreamingActive = true
-                startTranslationFlow()
+            if (isStreamingActive) {
+                Toast.makeText(this, "Already listening...", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
+
+            // Session TXT starts on first Play after app launch (and continues across Pause/threshold/background)
+            transcriptSaver?.ensureSessionStarted()
+
+            isStreamingActive = true
+            startTranslationFlow()
         }
 
         btnPause?.setOnClickListener {
@@ -338,11 +312,12 @@ class MainActivity : AppCompatActivity() {
             
             // Ferma tutto ma non chiude l'app
             ttsManager?.interrupt()
-            audioRecorderManager?.stop()
-            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+            speechClient?.stop()
             
             // Ferma il timer del silenzio
             silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+            segmentRunnable?.let { segmentHandler.removeCallbacks(it) }
+            segmentRunnable = null
             
             statusTextView?.text = "Paused. Press Play to resume."
             statusTextView?.setTextColor(android.graphics.Color.YELLOW)
@@ -370,15 +345,13 @@ class MainActivity : AppCompatActivity() {
             Log.d("MainActivity", "User triggered TRANSLATE NOW")
             statusTextView?.append("\n[FORCING CUT...]")
             
-            // Forza il timer locale a scattare subito se c'è roba nel buffer
+            // Forza il timer locale a scattare subito se c'Ã¨ roba nel buffer
             silenceRunnable?.let {
                 silenceHandler.removeCallbacks(it)
                 it.run() // Esegue immediatamente la logica di traduzione
             }
             
-            if (::assemblyAIClient.isInitialized) {
-                assemblyAIClient.forceEndTurn()
-            }
+            speechClient?.forceEndTurn()
         }
     }
 
@@ -386,12 +359,13 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             // Stop clean (senza chiudere sessione txt)
             try { ttsManager?.interrupt() } catch (_: Exception) {}
-            try { audioRecorderManager?.stop() } catch (_: Exception) {}
-            try { if (::assemblyAIClient.isInitialized) assemblyAIClient.stop() } catch (_: Exception) {}
+            try { speechClient?.stop() } catch (_: Exception) {}
 
             // Stop timer silenzio
             silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
             silenceRunnable = null
+            segmentRunnable?.let { segmentHandler.removeCallbacks(it) }
+            segmentRunnable = null
             textBuffer.clear()
 
             // Se era attivo, riparte automaticamente come se avessi premuto Play
@@ -418,8 +392,7 @@ class MainActivity : AppCompatActivity() {
         // #endregion
         runOnUiThread {
             ttsManager?.interrupt()
-            audioRecorderManager?.stop()
-            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+            speechClient?.stop()
             
             statusTextView?.text = "Resetting..."
             
@@ -434,12 +407,13 @@ class MainActivity : AppCompatActivity() {
         // 1) Ferma timer silenzio
         silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
         silenceRunnable = null
+        segmentRunnable?.let { segmentHandler.removeCallbacks(it) }
+        segmentRunnable = null
 
         // 2) Ferma audio + websocket + TTS
         try { ttsManager?.interrupt() } catch (_: Exception) {}
         try { ttsManager?.stop() } catch (_: Exception) {}
-        try { audioRecorderManager?.stop() } catch (_: Exception) {}
-        try { if (::assemblyAIClient.isInitialized) assemblyAIClient.stop() } catch (_: Exception) {}
+        try { speechClient?.stop() } catch (_: Exception) {}
 
         // Close transcript session explicitly
         try { transcriptSaver?.endSession("Session ended by STOP") } catch (_: Exception) {}
@@ -484,66 +458,193 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupAssemblyAI() {
-        if (currentApiKey.isEmpty()) return
-
-        assemblyAIClient = AssemblyAIClient(currentApiKey, object : AssemblyAIClient.TranscriptionListener {
+    private fun setupSpeechRecognizer() {
+        speechClient = AndroidSpeechClient(this, object : AndroidSpeechClient.TranscriptionListener {
             override fun onConnected() {
                 runOnUiThread {
-                    statusTextView?.append("\nConnected! (Silence: ${currentSilenceThreshold}ms)\nSpeak now...")
+                    statusTextView?.append("\nListening... (Silence: ${currentSilenceThreshold}ms)\nSpeak now...")
                 }
+            }
+
+            override fun onSpeechStart() {
+                startSegmentTimer()
+            }
+
+            override fun onSpeechEnd() {
+                // End-of-speech may still deliver results; keep segment timer for forced cut
             }
 
             override fun onTranscription(text: String, isFinal: Boolean) {
-                // LOGICA CLIENT-SIDE SILENCE:
-                // Ignoriamo parzialmente isFinal. Accumuliamo tutto e usiamo il nostro timer.
-                
-                runOnUiThread {
-                    // Se arriva nuovo testo, resettiamo il timer
-                    silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
-                    
-                    // Se è un parziale, aggiorniamo solo la UI "En: ..."
-                    // Se è Final (dal server), lo aggiungiamo al nostro buffer
-                    if (isFinal) {
-                        if (textBuffer.isNotEmpty()) textBuffer.append(" ")
-                        textBuffer.append(text)
-                        
-                        // Aggiorniamo UI provvisoria con tutto il buffer
-                        statusTextView?.text = "En: $textBuffer..."
-                    } else {
-                        // Per i parziali, mostriamo Buffer confermato + Parziale corrente
-                        val currentView = if (textBuffer.isNotEmpty()) "$textBuffer $text" else text
-                        statusTextView?.text = "En: $currentView..."
-                    }
+                if (text.isNotBlank()) {
+                    lastResultAt = System.currentTimeMillis()
+                }
+                handleTranscription(text, isFinal)
 
-                    // Avviamo il timer di silenzio
-                    silenceRunnable = Runnable {
-                        // IL TIMER È SCATTATO!
-                        // Significa che per X secondi non è arrivato NIENTE (né parziale né final)
-                        
-                        // Se abbiamo testo parziale non finalizzato, purtroppo AssemblyAI non ce lo dà "fermo".
-                        // Ma se abbiamo testo nel buffer (da precedenti Final), lo mandiamo.
-                        // O se l'ultimo evento era Final, il buffer è pronto.
-                        
-                        val textToTranslate = textBuffer.toString().trim()
-                        if (textToTranslate.isNotEmpty()) {
-                            processTranslation(textToTranslate)
-                            textBuffer.clear()
+                if (isFinal && isStreamingActive) {
+                    statusTextView?.postDelayed({
+                        if (isStreamingActive) {
+                            speechClient?.start()
                         }
-                    }
-                    
-                    // Usiamo il valore della levetta come ritardo
-                    silenceHandler.postDelayed(silenceRunnable!!, currentSilenceThreshold.toLong())
+                    }, 250)
                 }
             }
 
-            override fun onError(error: String) {
-                Log.e("MainActivity", "Error: $error")
-                runOnUiThread {
-                    statusTextView?.text = "Error: $error"
+            override fun onError(errorCode: Int, error: String) {
+                Log.e("MainActivity", "Error: $error (code=$errorCode)")
+
+                val isLanguageError =
+                    errorCode == android.speech.SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+                        errorCode == android.speech.SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
+
+                if (isLanguageError) {
+                    isStreamingActive = false
+                    try { speechClient?.stop() } catch (_: Exception) {}
+                    runOnUiThread {
+                        statusTextView?.text =
+                            "English speech recognition not available.\n" +
+                                "Install English (US) speech pack for the active recognizer " +
+                                "(Android System Intelligence or Google), then press Play."
+                        statusTextView?.setTextColor(android.graphics.Color.RED)
+                    }
+                    if (!hasOpenedSpeechSettings) {
+                        hasOpenedSpeechSettings = true
+                        openSpeechLanguageSettings()
+                    }
+                    return
+                }
+
+                val now = System.currentTimeMillis()
+                val recentlyHadResult = (now - lastResultAt) < 1500
+
+                val isBenign = errorCode == android.speech.SpeechRecognizer.ERROR_NO_MATCH ||
+                    errorCode == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+
+                if (!recentlyHadResult && !isBenign) {
+                    runOnUiThread {
+                        statusTextView?.text = "Error: $error"
+                    }
+                }
+
+                if (isStreamingActive) {
+                    val delayMs = when (errorCode) {
+                        android.speech.SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                        android.speech.SpeechRecognizer.ERROR_CLIENT,
+                        android.speech.SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> 1000L
+                        else -> 500L
+                    }
+                    statusTextView?.postDelayed({
+                        if (isStreamingActive) {
+                            speechClient?.destroy()
+                            setupSpeechRecognizer()
+                            speechClient?.start()
+                        }
+                    }, delayMs)
                 }
             }
         })
+    }
+
+    private fun openSpeechLanguageSettings() {
+        val intents = listOf(
+            Intent().setClassName(
+                "com.google.android.as",
+                "com.google.android.apps.miphone.aiai.speech.languagepacks.settings.ui.SettingsActivity"
+            ),
+            Intent("com.google.android.speech.embedded.MANAGE_LANGUAGES")
+                .setPackage("com.google.android.googlequicksearchbox"),
+            Intent().setClassName(
+                "com.google.android.googlequicksearchbox",
+                "com.google.android.libraries.speech.modelmanager.languagepack.settings.SettingsActivity"
+            ),
+            Intent().setClassName(
+                "com.google.android.googlequicksearchbox",
+                "com.google.android.libraries.speech.modelmanager.languagepack.settings.AddLanguagesActivity"
+            ),
+            Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+        )
+
+        for (intent in intents) {
+            try {
+                startActivity(intent)
+                return
+            } catch (_: ActivityNotFoundException) {
+                // Try next
+            } catch (_: Exception) {
+                // Ignore and continue
+            }
+        }
+
+        Toast.makeText(
+            this,
+            "Unable to open speech language settings. Please install English (US) voice input.",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun startSegmentTimer() {
+        if (segmentRunnable != null) return
+
+        segmentRunnable = Runnable {
+            val textToTranslate = textBuffer.toString().trim().ifEmpty { lastPartialText.trim() }
+            if (textToTranslate.isNotEmpty()) {
+                processTranslation(textToTranslate)
+                textBuffer.clear()
+                lastPartialText = ""
+            }
+            silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+            segmentRunnable = null
+            if (isStreamingActive) {
+                speechClient?.forceEndTurn()
+            }
+        }
+        segmentHandler.postDelayed(segmentRunnable!!, maxSegmentMs.toLong())
+    }
+
+    private fun clearSegmentTimer() {
+        segmentRunnable?.let { segmentHandler.removeCallbacks(it) }
+        segmentRunnable = null
+    }
+
+    private fun handleTranscription(text: String, isFinal: Boolean) {
+        // LOGICA CLIENT-SIDE SILENCE:
+        // Ignoriamo parzialmente isFinal. Accumuliamo tutto e usiamo il nostro timer.
+        runOnUiThread {
+            // Se arriva nuovo testo, resettiamo il timer
+            silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+
+            // Se Ã¨ un parziale, aggiorniamo solo la UI "En: ..."
+            // Se Ã¨ Final, lo aggiungiamo al nostro buffer
+            if (isFinal) {
+                if (textBuffer.isNotEmpty()) textBuffer.append(" ")
+                textBuffer.append(text)
+                lastPartialText = ""
+
+                // Aggiorniamo UI provvisoria con tutto il buffer
+                statusTextView?.text = "En: $textBuffer..."
+            } else {
+                // Per i parziali, mostriamo Buffer confermato + Parziale corrente
+                lastPartialText = text
+                val currentView = if (textBuffer.isNotEmpty()) "$textBuffer $text" else text
+                statusTextView?.text = "En: $currentView..."
+            }
+
+            // Avviamo il timer di silenzio
+            silenceRunnable = Runnable {
+                // IL TIMER ? SCATTATO!
+                val textToTranslate = textBuffer.toString().trim().ifEmpty { lastPartialText.trim() }
+                if (textToTranslate.isNotEmpty()) {
+                    processTranslation(textToTranslate)
+                    textBuffer.clear()
+                    lastPartialText = ""
+                }
+                clearSegmentTimer()
+            }
+
+            // Usiamo il valore della levetta come ritardo
+            silenceHandler.postDelayed(silenceRunnable!!, currentSilenceThreshold.toLong())
+
+            startSegmentTimer()
+        }
     }
 
     private fun processTranslation(text: String) {
@@ -563,6 +664,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkPermissionsAndStart() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            statusTextView?.text = "Speech recognition not available on this device."
+            return
+        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             checkKeyAndStart()
         } else {
@@ -571,11 +676,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkKeyAndStart() {
-        if (currentApiKey.isEmpty()) {
-            Toast.makeText(this, "Please set API Key first", Toast.LENGTH_SHORT).show()
-            return
-        }
-        // Non avviamo più automaticamente. Aspettiamo il Play.
+        // Non avviamo automaticamente. Aspettiamo il Play.
         statusTextView?.text = "Ready. Press Play to start."
     }
 
@@ -586,33 +687,16 @@ class MainActivity : AppCompatActivity() {
             statusTextView?.setTextColor(android.graphics.Color.YELLOW)
 
             // Cleanup preventivo
-            if (::assemblyAIClient.isInitialized) {
-                Log.d("MainActivity", "DEBUG: Stopping previous client")
-                try { assemblyAIClient.stop() } catch (e: Exception) { Log.e("MainActivity", "Stop error", e) }
-            }
-            audioRecorderManager?.stop()
+            speechClient?.destroy()
 
-            Log.d("MainActivity", "DEBUG: Calling setupAssemblyAI")
-            setupAssemblyAI()
-            
-            if (!::assemblyAIClient.isInitialized) {
-                Log.e("MainActivity", "DEBUG: Client FAILED to initialize")
-                statusTextView?.text = "Error: Client not initialized (Check API Key)"
-                return
-            }
+            Log.d("MainActivity", "DEBUG: Calling setupSpeechRecognizer")
+            setupSpeechRecognizer()
             
             // #region agent log
             logDebug("Starting translation flow with threshold", "$currentSilenceThreshold")
             // #endregion
-            Log.d("MainActivity", "DEBUG: Starting client with threshold $currentSilenceThreshold")
-            assemblyAIClient.start(currentSilenceThreshold)
-
-            audioRecorderManager = AudioRecorderManager { audioData ->
-                assemblyAIClient.sendAudio(audioData)
-            }
-            
-            Log.d("MainActivity", "DEBUG: Starting recorder")
-            audioRecorderManager?.start()
+            Log.d("MainActivity", "DEBUG: Starting SpeechRecognizer")
+            speechClient?.start()
             isStreamingActive = true
             
         } catch (e: Exception) {
@@ -626,8 +710,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         isStreamingActive = false
-        audioRecorderManager?.stop()
-        if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+        speechClient?.destroy()
         translationManager?.close()
         ttsManager?.stop()
         try { transcriptSaver?.endSession("Session ended (onDestroy)") } catch (_: Exception) {}

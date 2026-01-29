@@ -9,28 +9,39 @@ import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class TranscriptSaver(private val context: Context) {
 
+    private val ioExecutor = Executors.newSingleThreadExecutor()
     private var currentFileUri: android.net.Uri? = null
     private var sessionActive: Boolean = false
 
     fun ensureSessionStarted() {
-        if (sessionActive && currentFileUri != null) return
-        startNewSession()
-        sessionActive = true
+        runIo {
+            if (sessionActive && currentFileUri != null) return@runIo
+            startNewSessionLocked()
+        }
     }
 
     fun endSession(reason: String = "Session ended") {
-        if (!sessionActive) return
-        try {
-            append("--- $reason ---")
-        } catch (_: Exception) {}
-        currentFileUri = null
-        sessionActive = false
+        runIo {
+            if (!sessionActive) return@runIo
+            try {
+                writeLineLocked("--- $reason ---")
+            } catch (_: Exception) {}
+            currentFileUri = null
+            sessionActive = false
+        }
     }
     
     fun startNewSession() {
+        runIo {
+            startNewSessionLocked()
+        }
+    }
+
+    private fun startNewSessionLocked() {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val filename = "Montheflow_Session_$timestamp.txt"
 
@@ -42,17 +53,29 @@ class TranscriptSaver(private val context: Context) {
 
         try {
             currentFileUri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
-            append("--- Session Started: $timestamp ---\n")
-            Log.d(TAG, "Created transcript file: $filename")
-            sessionActive = true
+            sessionActive = currentFileUri != null
+            if (sessionActive) {
+                writeLineLocked("--- Session Started: $timestamp ---")
+                Log.d(TAG, "Created transcript file: $filename")
+            } else {
+                Log.e(TAG, "Error creating transcript file: null Uri")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error creating transcript file", e)
         }
     }
 
     fun append(text: String) {
-        if (!sessionActive || currentFileUri == null) return
+        runIo {
+            if (!sessionActive || currentFileUri == null) {
+                startNewSessionLocked()
+            }
+            if (!sessionActive || currentFileUri == null) return@runIo
+            writeLineLocked(text)
+        }
+    }
 
+    private fun writeLineLocked(text: String) {
         try {
             // "wa" mode opens for writing and appending
             val os: OutputStream? = context.contentResolver.openOutputStream(currentFileUri!!, "wa")
@@ -61,6 +84,16 @@ class TranscriptSaver(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing to transcript file", e)
+        }
+    }
+
+    private fun runIo(task: () -> Unit) {
+        ioExecutor.execute {
+            try {
+                task()
+            } catch (e: Exception) {
+                Log.e(TAG, "Transcript I/O error", e)
+            }
         }
     }
 
