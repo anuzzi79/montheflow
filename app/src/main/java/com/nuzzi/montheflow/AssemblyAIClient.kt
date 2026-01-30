@@ -3,6 +3,7 @@ package com.nuzzi.montheflow
 import android.util.Log
 import com.google.gson.Gson
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
 import okio.ByteString.Companion.toByteString
 import java.io.File
 import java.util.Date
@@ -15,6 +16,7 @@ class AssemblyAIClient(
     private val client = OkHttpClient()
     private var webSocket: WebSocket? = null
     private val gson = Gson()
+    private var audioChunkCounter = 0
 
     interface TranscriptionListener {
         fun onTranscription(text: String, isFinal: Boolean)
@@ -24,21 +26,17 @@ class AssemblyAIClient(
 
     private fun logDebug(message: String, data: String = "{}") {
         try {
-            val file = File("c:\\Users\\Antonio Nuzzi\\montheflow\\.cursor\\debug.log")
-            val timestamp = System.currentTimeMillis()
-            val json = "{\"id\":\"log_${timestamp}\",\"timestamp\":$timestamp,\"location\":\"AssemblyAIClient.kt\",\"message\":\"$message\",\"data\":$data,\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A,B,C\"}\n"
-            file.appendText(json)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to write debug log", e)
-        }
+             // Optional: restore file logging or just remove
+        } catch (e: Exception) {}
     }
 
     fun start(silenceThreshold: Int = 500) {
         // RIMOSSO format_turns=true per testare se interferisce con il silenzio
-        // val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&format_turns=true&end_utterance_silence_threshold=$silenceThreshold"
-        val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&end_utterance_silence_threshold=$silenceThreshold"
+        // Abilitiamo il modello Multilingual con Language Detection automatico
+        // Supporta automaticamente: Inglese, Italiano, Portoghese, Spagnolo, Francese, Tedesco.
+        val url = "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&end_utterance_silence_threshold=$silenceThreshold&speech_model=universal-streaming-multilingual&language_detection=true"
         
-        Log.d(TAG, "Connecting to V3 URL: ${url.replace(apiKey, "HIDDEN_KEY")}") // Log di verifica URL
+        Log.d(TAG, "Connecting to V3 URL (Multilingual): ${url.replace(apiKey, "HIDDEN_KEY")}") // Log di verifica URL
         Log.d(TAG, "Silence Threshold applied: $silenceThreshold ms")
         
         // #region agent log

@@ -143,17 +143,29 @@ class MainActivity : AppCompatActivity() {
                     statusTextView?.text = "ERROR: $statusMsg"
                     statusTextView?.setTextColor(android.graphics.Color.RED)
                     progressBar?.visibility = View.INVISIBLE
+                    btnPlay?.isEnabled = true
+                    btnPlay?.alpha = 1.0f
                 } else {
-                    if (statusTextView?.text?.startsWith("En:") == false) {
-                        statusTextView?.text = statusMsg
-                        statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
-                    }
-                    
-                    // Gestione ProgressBar
+                    // Gestione ProgressBar e Play Button
                     if (statusMsg.contains("Downloading", ignoreCase = true)) {
                         progressBar?.visibility = View.VISIBLE
+                        btnPlay?.isEnabled = false
+                        btnPlay?.alpha = 0.5f // Visivamente disabilitato
+                        statusTextView?.text = "Preparing language... Please wait."
+                        statusTextView?.setTextColor(android.graphics.Color.YELLOW)
                     } else if (statusMsg.contains("Ready", ignoreCase = true)) {
                         progressBar?.visibility = View.INVISIBLE
+                        btnPlay?.isEnabled = true
+                        btnPlay?.alpha = 1.0f
+                        if (statusTextView?.text?.contains("Preparing") == true) {
+                             statusTextView?.text = "Ready. Press Play to start."
+                             statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+                        }
+                    }
+                    
+                    if (statusTextView?.text?.startsWith("En:") == false && !statusMsg.contains("Downloading") && !statusMsg.contains("Ready")) {
+                        statusTextView?.text = statusMsg
+                        statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
                     }
                 }
             }
@@ -314,9 +326,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnPlay?.setOnClickListener {
+            // Se sta scaricando, non fare nulla (il bottone dovrebbe essere disabilitato visivamente, ma per sicurezza)
+            if (progressBar?.visibility == View.VISIBLE) {
+                Toast.makeText(this, "Wait for download to finish...", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
             Log.d("MainActivity", "DEBUG: User triggered PLAY (Listener OK)")
             Toast.makeText(this, "Play Clicked!", Toast.LENGTH_SHORT).show() 
-
+            
             if (currentApiKey.isEmpty()) {
                 Log.e("MainActivity", "DEBUG: API Key is empty!")
                 Toast.makeText(this, "Please configure API Key first", Toast.LENGTH_SHORT).show()
