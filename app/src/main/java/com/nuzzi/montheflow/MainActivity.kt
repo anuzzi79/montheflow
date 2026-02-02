@@ -35,6 +35,8 @@ class MainActivity : AppCompatActivity() {
     private var translationManager: TranslationManager? = null
     private var ttsManager: TTSManager? = null
     private var transcriptSaver: TranscriptSaver? = null
+    private var openAIClient: OpenAIRealtimeClient? = null
+    private var openAIAudioPlayer: OpenAIAudioPlayer? = null
     
     // UI elements
     private var statusTextView: TextView? = null
@@ -56,11 +58,16 @@ class MainActivity : AppCompatActivity() {
     private var radioPortuguese: RadioButton? = null
 
     private var currentApiKey: String = ""
+    private var openAIApiKey: String = ""
+    private var useOpenAI: Boolean = false
     
     // Timer per gestire il silenzio manualmente (Client-Side)
     private var silenceHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var silenceRunnable: Runnable? = null
     private var textBuffer = StringBuilder()
+    private var openAIInputText: String = ""
+    private var openAIOutputText: String = ""
+    private var openAILastInputFinal: String = ""
     
     // True quando streaming + recorder sono attivi (equivalente a "sessione in andamento")
     private var isStreamingActive: Boolean = false
@@ -102,6 +109,10 @@ class MainActivity : AppCompatActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
+        val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
+        useOpenAI = prefs.getBoolean("USE_OPENAI", false)
+        AppLogger.init(this)
+
         statusTextView = findViewById(R.id.statusText)
         progressBar = findViewById(R.id.progressBar)
         languageRadioGroup = findViewById(R.id.languageRadioGroup)
@@ -137,6 +148,7 @@ class MainActivity : AppCompatActivity() {
 
         // Inizializza Traduzione con gestione stato visuale
         translationManager = TranslationManager { statusMsg, isError ->
+            if (useOpenAI) return@TranslationManager
             Log.d("MainActivity", "Translation Status: $statusMsg")
             runOnUiThread {
                 if (isError) {
@@ -265,16 +277,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun validateApiKeyAndInit() {
         val prefs = getSharedPreferences("MontheflowPrefs", Context.MODE_PRIVATE)
-        val storedKey = prefs.getString("ASSEMBLYAI_KEY", "")
+        useOpenAI = prefs.getBoolean("USE_OPENAI", false)
 
-        if (storedKey.isNullOrEmpty()) {
-            statusTextView?.text = "API Key Missing!\nPlease configure settings."
-            startSettingsBlink()
+        if (useOpenAI) {
+            val storedKey = prefs.getString("OPENAI_KEY", "")
+            if (storedKey.isNullOrEmpty()) {
+                statusTextView?.text = "OpenAI API Key Missing!\nPlease configure settings."
+                startSettingsBlink()
+                return
+            }
+            progressBar?.visibility = View.INVISIBLE
+            stopSettingsBlink()
+            openAIApiKey = storedKey
         } else {
+            val storedKey = prefs.getString("ASSEMBLYAI_KEY", "")
+            if (storedKey.isNullOrEmpty()) {
+                statusTextView?.text = "API Key Missing!\nPlease configure settings."
+                startSettingsBlink()
+                return
+            }
             stopSettingsBlink()
             currentApiKey = storedKey
-            checkPermissionsAndStart()
         }
+
+        checkPermissionsAndStart()
     }
 
     private var blinkAnimator: ObjectAnimator? = null
@@ -302,10 +328,18 @@ class MainActivity : AppCompatActivity() {
 
             when (checkedId) {
                 R.id.radioItalian -> {
-                    changeTargetLanguage(TranslateLanguage.ITALIAN, Locale.ITALIAN)
+                    if (useOpenAI) {
+                        openAIClient?.updateTargetLanguage("Italian", currentSilenceThreshold)
+                    } else {
+                        changeTargetLanguage(TranslateLanguage.ITALIAN, Locale.ITALIAN)
+                    }
                 }
                 R.id.radioPortuguese -> {
-                    changeTargetLanguage(TranslateLanguage.PORTUGUESE, Locale("pt", "BR"))
+                    if (useOpenAI) {
+                        openAIClient?.updateTargetLanguage("Portuguese (Brazil)", currentSilenceThreshold)
+                    } else {
+                        changeTargetLanguage(TranslateLanguage.PORTUGUESE, Locale("pt", "BR"))
+                    }
                 }
             }
         }
@@ -335,33 +369,46 @@ class MainActivity : AppCompatActivity() {
             Log.d("MainActivity", "DEBUG: User triggered PLAY (Listener OK)")
             Toast.makeText(this, "Play Clicked!", Toast.LENGTH_SHORT).show() 
             
-            if (currentApiKey.isEmpty()) {
+            val activeKey = if (useOpenAI) openAIApiKey else currentApiKey
+            if (activeKey.isEmpty()) {
                 Log.e("MainActivity", "DEBUG: API Key is empty!")
                 Toast.makeText(this, "Please configure API Key first", Toast.LENGTH_SHORT).show()
                 startSettingsBlink()
             } else {
-                Log.d("MainActivity", "DEBUG: Key found, calling startTranslationFlow")
+                Log.d("MainActivity", "DEBUG: Key found, starting flow")
 
                 // Session TXT starts on first Play after app launch (and continues across Pause/threshold/background)
                 transcriptSaver?.ensureSessionStarted()
 
                 isStreamingActive = true
-                startTranslationFlow()
+                if (useOpenAI) {
+                    startOpenAIFlow()
+                } else {
+                    startTranslationFlow()
+                }
             }
         }
 
         btnPause?.setOnClickListener {
             Log.d("MainActivity", "User triggered PAUSE/STOP")
             isStreamingActive = false
-            
-            // Ferma tutto ma non chiude l'app
-            ttsManager?.interrupt()
-            audioRecorderManager?.stop()
-            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
-            
-            // Ferma il timer del silenzio
-            silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
-            
+
+            if (useOpenAI) {
+                openAIAudioPlayer?.interrupt()
+                audioRecorderManager?.stop()
+                audioRecorderManager = null
+                openAIClient?.stop()
+                AppLogger.log("OPENAI", "paused by user")
+            } else {
+                // Ferma tutto ma non chiude l'app
+                ttsManager?.interrupt()
+                audioRecorderManager?.stop()
+                if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+
+                // Ferma il timer del silenzio
+                silenceRunnable?.let { silenceHandler.removeCallbacks(it) }
+            }
+
             statusTextView?.text = "Paused. Press Play to resume."
             statusTextView?.setTextColor(android.graphics.Color.YELLOW)
         }
@@ -369,12 +416,14 @@ class MainActivity : AppCompatActivity() {
         btnStop?.setOnClickListener {
             Log.d("MainActivity", "User triggered STOP (End session & exit)")
             isStreamingActive = false
+            AppLogger.log("APP", "stop pressed")
             endSessionAndExitApp()
         }
 
         btnReset?.setOnClickListener {
             Log.d("MainActivity", "User triggered RESET")
             isStreamingActive = false
+            AppLogger.log("APP", "reset pressed")
             resetAppFlow()
         }
         
@@ -386,6 +435,11 @@ class MainActivity : AppCompatActivity() {
 
         btnTranslateNow?.setOnClickListener {
             Log.d("MainActivity", "User triggered TRANSLATE NOW")
+            if (useOpenAI) {
+                Toast.makeText(this, "OpenAI mode: force cut not available", Toast.LENGTH_SHORT).show()
+                AppLogger.log("OPENAI", "translate-now pressed (ignored in OpenAI mode)")
+                return@setOnClickListener
+            }
             statusTextView?.append("\n[FORCING CUT...]")
             
             // Forza il timer locale a scattare subito se c'è roba nel buffer
@@ -402,6 +456,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun restartAfterThresholdChange(wasActive: Boolean) {
         runOnUiThread {
+            if (useOpenAI) {
+                openAIClient?.updateTargetLanguage(getOpenAITargetLanguage(), currentSilenceThreshold)
+                if (wasActive) {
+                    statusTextView?.text = "Updated OpenAI threshold."
+                    statusTextView?.setTextColor(android.graphics.Color.YELLOW)
+                } else {
+                    statusTextView?.text = "Ready. Press Play to start."
+                    statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+                }
+                return@runOnUiThread
+            }
+
             // Stop clean (senza chiudere sessione txt)
             try { ttsManager?.interrupt() } catch (_: Exception) {}
             try { audioRecorderManager?.stop() } catch (_: Exception) {}
@@ -435,6 +501,21 @@ class MainActivity : AppCompatActivity() {
         logDebug("resetAppFlow called")
         // #endregion
         runOnUiThread {
+            if (useOpenAI) {
+                openAIAudioPlayer?.interrupt()
+                audioRecorderManager?.stop()
+                audioRecorderManager = null
+                openAIClient?.stop()
+
+                statusTextView?.text = "Resetting..."
+
+                statusTextView?.postDelayed({
+                    statusTextView?.text = "Restarting..."
+                    checkPermissionsAndStart()
+                }, 500)
+                return@runOnUiThread
+            }
+
             ttsManager?.interrupt()
             audioRecorderManager?.stop()
             if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
@@ -458,6 +539,8 @@ class MainActivity : AppCompatActivity() {
         try { ttsManager?.stop() } catch (_: Exception) {}
         try { audioRecorderManager?.stop() } catch (_: Exception) {}
         try { if (::assemblyAIClient.isInitialized) assemblyAIClient.stop() } catch (_: Exception) {}
+        try { openAIClient?.stop() } catch (_: Exception) {}
+        try { openAIAudioPlayer?.stop() } catch (_: Exception) {}
 
         // Close transcript session explicitly
         try { transcriptSaver?.endSession("Session ended by STOP") } catch (_: Exception) {}
@@ -589,12 +672,176 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkKeyAndStart() {
-        if (currentApiKey.isEmpty()) {
+        val activeKey = if (useOpenAI) openAIApiKey else currentApiKey
+        if (activeKey.isEmpty()) {
             Toast.makeText(this, "Please set API Key first", Toast.LENGTH_SHORT).show()
             return
         }
         // Non avviamo più automaticamente. Aspettiamo il Play.
-        statusTextView?.text = "Ready. Press Play to start."
+        statusTextView?.text = if (useOpenAI) {
+            "Ready. Press Play to start (OpenAI)."
+        } else {
+            "Ready. Press Play to start."
+        }
+    }
+
+    private fun getOpenAITargetLanguage(): String {
+        return if (radioPortuguese?.isChecked == true) {
+            "Portuguese (Brazil)"
+        } else {
+            "Italian"
+        }
+    }
+
+    private fun updateOpenAIStatus() {
+        runOnUiThread {
+            val input = openAIInputText.trim()
+            val output = openAIOutputText.trim()
+            if (input.isEmpty() && output.isEmpty()) return@runOnUiThread
+
+            val sb = StringBuilder()
+            if (input.isNotEmpty()) {
+                sb.append("En: ").append(input)
+            }
+            if (output.isNotEmpty()) {
+                if (sb.isNotEmpty()) sb.append("\n")
+                sb.append("Target: ").append(output)
+            }
+            statusTextView?.text = sb.toString()
+            statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+        }
+    }
+
+    private fun startOpenAIFlow() {
+        Log.d("MainActivity", "DEBUG: Inside startOpenAIFlow")
+        try {
+            statusTextView?.text = "Connecting to OpenAI..."
+            statusTextView?.setTextColor(android.graphics.Color.YELLOW)
+            progressBar?.visibility = View.INVISIBLE
+
+            openAIClient?.stop()
+            audioRecorderManager?.stop()
+            audioRecorderManager = null
+            openAIAudioPlayer?.stop()
+            if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+            ttsManager?.interrupt()
+
+            openAIAudioPlayer = OpenAIAudioPlayer()
+
+            val targetLanguage = getOpenAITargetLanguage()
+            AppLogger.log("OPENAI", "startOpenAIFlow target=$targetLanguage silenceMs=$currentSilenceThreshold")
+            openAIClient = OpenAIRealtimeClient(openAIApiKey, object : OpenAIRealtimeClient.Listener {
+                override fun onConnected() {
+                    runOnUiThread {
+                        statusTextView?.text = "Connected (OpenAI). Speak now..."
+                        statusTextView?.setTextColor(android.graphics.Color.LTGRAY)
+                    }
+                    AppLogger.log("OPENAI", "socket connected, waiting session ready")
+                }
+
+                override fun onDisconnected() {
+                    runOnUiThread {
+                        statusTextView?.text = "OpenAI disconnected."
+                        statusTextView?.setTextColor(android.graphics.Color.RED)
+                    }
+                    AppLogger.log("OPENAI", "socket disconnected")
+                }
+
+                override fun onInputTranscript(text: String, isFinal: Boolean) {
+                    openAIInputText = text
+                    if (isFinal) {
+                        openAILastInputFinal = text
+                    }
+                    AppLogger.log("OPENAI", "input transcript (final=$isFinal): ${text.take(200)}")
+                    updateOpenAIStatus()
+                }
+
+                override fun onOutputTranscript(text: String, isFinal: Boolean) {
+                    openAIOutputText = text
+                    AppLogger.log("OPENAI", "output transcript (final=$isFinal): ${text.take(200)}")
+                    updateOpenAIStatus()
+                    if (isFinal && openAILastInputFinal.isNotEmpty()) {
+                        val logLine = "[EN]: $openAILastInputFinal\n[TR]: $openAIOutputText\n"
+                        transcriptSaver?.append(logLine)
+                    }
+                }
+
+                override fun onAudioDelta(audio: ByteArray) {
+                    openAIAudioPlayer?.playAudio(audio)
+                }
+
+                override fun onSpeechStarted() {
+                    openAIAudioPlayer?.interrupt()
+                    openAIInputText = ""
+                    openAIOutputText = ""
+                    openAILastInputFinal = ""
+                    AppLogger.log("OPENAI", "speech started")
+                    updateOpenAIStatus()
+                }
+
+                override fun onSessionReady() {
+                    if (audioRecorderManager != null) return
+                    AppLogger.log("OPENAI", "session ready, starting recorder")
+                    var chunkCounter = 0
+                    // Try native 24k first; fallback to 16k + resample if needed
+                    val recorder24k = AudioRecorderManager({ audioData ->
+                        chunkCounter++
+                        if (chunkCounter % 50 == 0) {
+                            AppLogger.log("AUDIO", "sending 24k chunk bytes=${audioData.size} count=$chunkCounter")
+                        }
+                        openAIClient?.sendAudio(audioData)
+                    }, 24000)
+
+                    if (recorder24k.start()) {
+                        AppLogger.log("AUDIO", "using 24k recorder")
+                        audioRecorderManager = recorder24k
+                        isStreamingActive = true
+                        return
+                    }
+
+                    AppLogger.log("AUDIO", "24k recorder failed, falling back to 16k + resample")
+                    val recorder16k = AudioRecorderManager({ audioData ->
+                        val resampled = PcmResampler.upsample16kTo24k(audioData)
+                        chunkCounter++
+                        if (chunkCounter % 50 == 0) {
+                            AppLogger.log("AUDIO", "sending 16k->24k chunk bytes=${resampled.size} count=$chunkCounter")
+                        }
+                        openAIClient?.sendAudio(resampled)
+                    }, 16000)
+
+                    if (recorder16k.start()) {
+                        audioRecorderManager = recorder16k
+                        isStreamingActive = true
+                    } else {
+                        AppLogger.log("AUDIO", "16k recorder failed")
+                        runOnUiThread {
+                            statusTextView?.text = "Microphone start failed"
+                            statusTextView?.setTextColor(android.graphics.Color.RED)
+                        }
+                    }
+                }
+
+                override fun onError(message: String) {
+                    runOnUiThread {
+                        statusTextView?.text = "OpenAI Error: $message"
+                        statusTextView?.setTextColor(android.graphics.Color.RED)
+                    }
+                    AppLogger.log("OPENAI", "error: $message")
+                }
+
+                override fun onStatus(message: String) {
+                    Log.d("MainActivity", "OpenAI: $message")
+                    AppLogger.log("OPENAI", "status: $message")
+                }
+            })
+
+            openAIClient?.connect(targetLanguage, currentSilenceThreshold)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error starting OpenAI flow", e)
+            statusTextView?.text = "Error starting OpenAI: ${e.message}"
+            statusTextView?.setTextColor(android.graphics.Color.RED)
+            isStreamingActive = false
+        }
     }
 
     private fun startTranslationFlow() {
@@ -602,6 +849,9 @@ class MainActivity : AppCompatActivity() {
         try {
             statusTextView?.text = "Connecting..."
             statusTextView?.setTextColor(android.graphics.Color.YELLOW)
+
+            openAIClient?.stop()
+            openAIAudioPlayer?.stop()
 
             // Cleanup preventivo
             if (::assemblyAIClient.isInitialized) {
@@ -625,9 +875,9 @@ class MainActivity : AppCompatActivity() {
             Log.d("MainActivity", "DEBUG: Starting client with threshold $currentSilenceThreshold")
             assemblyAIClient.start(currentSilenceThreshold)
 
-            audioRecorderManager = AudioRecorderManager { audioData ->
+            audioRecorderManager = AudioRecorderManager({ audioData ->
                 assemblyAIClient.sendAudio(audioData)
-            }
+            })
             
             Log.d("MainActivity", "DEBUG: Starting recorder")
             audioRecorderManager?.start()
@@ -646,6 +896,8 @@ class MainActivity : AppCompatActivity() {
         isStreamingActive = false
         audioRecorderManager?.stop()
         if (::assemblyAIClient.isInitialized) assemblyAIClient.stop()
+        openAIClient?.stop()
+        openAIAudioPlayer?.stop()
         translationManager?.close()
         ttsManager?.stop()
         try { transcriptSaver?.endSession("Session ended (onDestroy)") } catch (_: Exception) {}

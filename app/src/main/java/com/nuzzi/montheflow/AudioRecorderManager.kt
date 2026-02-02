@@ -10,14 +10,17 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 
-class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
+class AudioRecorderManager(
+    private val callback: (ByteArray) -> Unit,
+    private val sampleRate: Int = 16000
+) {
 
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var recordingThread: Thread? = null
 
     // Configurazioni richieste da AssemblyAI
-    private val SAMPLE_RATE = 16000
+    private val SAMPLE_RATE = sampleRate
     private val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
     private val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
     
@@ -29,13 +32,14 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
     private val bufferSize = if (minBufferSize > 0) minBufferSize * 2 else 0
 
     @SuppressLint("MissingPermission") // Il permesso viene controllato prima di chiamare start() nella UI
-    fun start() {
-        if (isRecording) return
+    fun start(): Boolean {
+        if (isRecording) return true
 
         // Controllo preventivo per evitare crash su dispositivi non supportati
         if (bufferSize <= 0) {
             Log.e(TAG, "Invalid buffer size: $minBufferSize. Audio configuration not supported.")
-            return
+            AppLogger.log("AUDIO", "Invalid buffer size: $minBufferSize")
+            return false
         }
 
         try {
@@ -49,11 +53,13 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioRecord initialization failed")
-                return
+                AppLogger.log("AUDIO", "AudioRecord initialization failed")
+                return false
             }
 
             audioRecord?.startRecording()
             isRecording = true
+            AppLogger.log("AUDIO", "Recording started sampleRate=$SAMPLE_RATE bufferSize=$bufferSize")
 
             recordingThread = Thread {
                 readAudioLoop()
@@ -61,9 +67,12 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
             recordingThread?.start()
             
             Log.d(TAG, "Recording started")
+            return true
 
         } catch (e: Exception) {
             Log.e(TAG, "Error starting recording", e)
+            AppLogger.log("AUDIO", "Error starting recording: ${e.message}")
+            return false
         }
     }
 
@@ -77,8 +86,10 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
             audioRecord?.release()
             audioRecord = null
             Log.d(TAG, "Recording stopped")
+            AppLogger.log("AUDIO", "Recording stopped")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping recording", e)
+            AppLogger.log("AUDIO", "Error stopping recording: ${e.message}")
         }
     }
 
@@ -101,11 +112,11 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
     }
 
     private fun readAudioLoop() {
-        // Buffer di lettura: per inviare chunk frequenti.
-        // 16000 Hz * 2 bytes (16bit) = 32000 bytes/sec.
-        // Per 100ms (0.1s) = 3200 bytes.
-        val readBufferSize = 3200 
+        // Buffer di lettura: chunk frequenti (~100ms).
+        // sampleRate Hz * 2 bytes (16bit) = bytes/sec.
+        val readBufferSize = (SAMPLE_RATE / 10) * 2
         val data = ByteArray(readBufferSize)
+        var chunkCounter = 0
 
         try {
             while (isRecording) {
@@ -131,15 +142,15 @@ class AudioRecorderManager(private val callback: (ByteArray) -> Unit) {
                         }
                     }
                     val rms = Math.sqrt(sum / (result / 2))
-                    if (rms > 0.01) { // Threshold for "not silence"
-                        sendAgentLog("Non-silent audio detected! RMS: $rms")
-                    } else {
-                        // sendAgentLog("Silence... RMS: $rms") // Uncomment to debug silence
+                    chunkCounter++
+                    if (chunkCounter % 50 == 0) {
+                        AppLogger.log("AUDIO", "chunk=$chunkCounter bytes=$result rms=$rms")
                     }
 
                     callback(audioChunk)
                 } else if (result < 0) {
                     Log.w(TAG, "Audio read error: $result")
+                    AppLogger.log("AUDIO", "Audio read error: $result")
                     // Se l'errore è critico, usciamo dal loop
                     if (result == AudioRecord.ERROR_INVALID_OPERATION || result == AudioRecord.ERROR_BAD_VALUE) {
                         break
